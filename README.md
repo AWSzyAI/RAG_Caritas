@@ -5,14 +5,15 @@
 1. 配置`.env`
 ```
 KIMI_API_KEY = 
-KIMI_URL
-ZHIPU_API_KEY = 
-ZHIPU_URL
-SiliconFlow_API_KEY = 
-SiliconFlow_URL = 
+ZHIPU_API_key = 
+API_URL_ZHIPU=
+API_URL_siliconflow = 
+API_KEY_siliconflow = 
+
 ```
 
-2. 下载数据集：[百度网盘链接]()
+2. 下载数据集：[百度网盘链接](https://pan.baidu.com/s/1awbAjIMVueLZez9BRmVGqw)
+内部使用，密码暂不公开
 放置到`./data/`
 ```
 (base) szy@aw:~/2025/github/RAG_Caritas$ tree

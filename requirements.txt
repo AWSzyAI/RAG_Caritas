@@ -1,0 +1,9 @@
+numpy
+pandas
+scikit-learn
+requests
+tqdm
+jieba
+dotenv
+openai
+zhipuai

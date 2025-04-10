@@ -17,10 +17,24 @@ API_KEY_siliconflow =
 放置到`./data/`
 ```
 (base) szy@aw:~/2025/github/RAG_Caritas$ tree
+szy@aw ~/2/g/RAG_Caritas (main)> tree                                                                                                           (Caritas) 
 .
 ├── Makefile
 ├── README.md
 ├── cache
+│   ├── bge-m3-50
+│   │   ├── embedding_vectors.json
+│   │   ├── index.csv
+│   │   ├── metadata_cache.json
+│   │   ├── system_embedding_vectors.json
+│   │   └── system_metadata_cache.json
+│   └── embedding-3-50
+│       ├── embedding_vectors.json
+│       ├── fail.csv
+│       ├── index.csv
+│       ├── metadata_cache.json
+│       ├── system_embedding_vectors.json
+│       └── system_metadata_cache.json
 ├── data
 │   ├── 0315句子更新 - 汇总表.csv
 │   ├── articles.json
@@ -29,8 +43,10 @@ API_KEY_siliconflow =
 ├── kimi_api.py
 ├── logs
 ├── main.py
+├── output
 ├── requirements.txt
 └── test
+    └── clean_metadata.py
 ```
 
 3. 配置环境
@@ -44,6 +60,11 @@ python main.py
 ```
 
 
-
+---
+下一步计划：
+1. 不采用任何外部材料，根据prompt生成reponse
+2. 使用reponse，作为Query召回相关材料
+3. 过滤掉不相关的材料
+4. 使用材料改写reponse
 
 

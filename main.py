@@ -1,63 +1,48 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import json
 import os
-import tempfile
-import numpy as np
+import sys
 import requests
-import random  # 用于随机抽样
-import pandas as pd  # 用于 CSV 处理
-from sklearn.metrics.pairwise import cosine_similarity
+session = requests.Session()
 import hashlib
 import re
-from tqdm import tqdm  # 进度条库
 import time
 import argparse
 import datetime
-import jieba
 import logging
 import threading
-import concurrent.futures  # 新增并发模块
-import dotenv  # 用于加载环境变量
-import sys
+import concurrent.futures  
+
+import jieba
+import numpy as np
+import pandas as pd  # 用于 CSV 处理
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm  # 进度条库
 from dotenv import load_dotenv
-# 新业务相关导入
-from kimi_api import  send_messages
+load_dotenv()
 from zhipuai import ZhipuAI
 
-SYSTEM_FILE = "./data/system.json"
-
-load_dotenv()
+from kimi_api import  send_messages
 KIMI_API_KEY = os.getenv("KIMI_API_KEY")
 
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format='[%(asctime)s] %(levelname)s - %(message)s',
-#     datefmt='%Y-%m-%d %H:%M:%S'
-# )
+
+
+# ================================
+# EMBEDDING_MODEL = "bge-m3"     #
+EMBEDDING_MODEL = "embedding-3"  #
+CHUNK_SIZE = 50                  #
+# CHUNK_SIZE = 200               #
+BATCH_SIZE = 10
+SENTENCE_BATCH_SIZE = 100
+BATCH_REQUEST_TO_ZHIPU = True #测试一次性请求一篇文章中的所有切片
+MAX_WORKER = 20
+# ================================
+
+
+# ======================================================================
+ARTICLES_FILE = "./data/articles.json"
+SYSTEM_FILE = "./data/system.json"
 log_dir = "logs"
-os.makedirs(log_dir, exist_ok=True)
-log_filename = os.path.join(log_dir, f"log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    filename=log_filename,  # 把日志写入文件
-    filemode='a'  # 可选：'w' 覆盖写入，'a' 追加写入
-)
-
-# EMBEDDING_MODEL = "bge-m3"
-EMBEDDING_MODEL = "embedding-3"
-CHUNK_SIZE = 50
-# CHUNK_SIZE = 200
-# 确保./cache/{EMBEDDING_MODEL}存在
-cache_dir = os.path.join(".", "cache", f"{EMBEDDING_MODEL}-{CHUNK_SIZE}")
-OUTPUT_DIR = os.path.join(".", "output")
-# 确保目录存在
-os.makedirs(cache_dir, exist_ok=True)
-
+# ======================================================================
 if EMBEDDING_MODEL == "bge-m3":
     # bge-m3
     API_URL = os.getenv("API_URL_siliconflow")
@@ -70,7 +55,13 @@ elif EMBEDDING_MODEL == "embedding-3":
     API_KEY = os.getenv("ZHIPU_API_key")
     zhipu_client = ZhipuAI(api_key=API_KEY)
 
-
+# ========================================================================
+os.makedirs(log_dir, exist_ok=True)
+log_filename = os.path.join(log_dir, f"log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+cache_dir = os.path.join(".", "cache", f"{EMBEDDING_MODEL}-{CHUNK_SIZE}")
+OUTPUT_DIR = os.path.join(".", "output")
+os.makedirs(cache_dir, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 METADATA_FILE = f"{cache_dir}/metadata_cache.json"
 EMBEDDING_FILE = f"{cache_dir}/embedding_vectors.json"
 SYSTEM_METADATA_FILE = f"{cache_dir}/system_metadata_cache.json"
@@ -78,40 +69,20 @@ SYSTEM_EMBEDDING_FILE = f"{cache_dir}/system_embedding_vectors.json"
 INDEX_FILE = f"{cache_dir}/index.csv"
 FAIL_FILE = f"{cache_dir}/fail.csv"
 
-def extract_json(response):
-    match = re.search(r'\{.*\}', response, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError as e:
-            logging.warning(f"JSON 解析失败: {e}, 跳过该条数据: {response}")
-            return None
-    else:
-        logging.warning(f"未找到 JSON 数据: {response}")
-        return None
+UNPROCESSED = "❌"
+PROCESSED = "✅"
+# =========================================================================
+# 设置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    filename=log_filename,  # 把日志写入文件
+    filemode='a'  # 可选：'w' 覆盖写入，'a' 追加写入
+)
+# =========================================================================
 
-# 定义辅助函数
-def clean_value(value):
-    """简单清洗返回值（如去除两端空格）"""
-    return value.strip() if isinstance(value, str) else value
 
-# 新业务：实现 query_partitions，根据输入句子查询前 k 个相关的文本切片作为素材
-def query_partitions(sentence, k=3, threshold=0.4):
-    """
-    根据输入的句子，使用 find_matches 查询获得前 k 个匹配的文本切片，
-    拼接片段内容和对应链接形成素材字符串。
-    """
-    matches = find_matches([sentence], top_n=k, threshold=threshold)
-    parts = ""
-    if matches and matches[0]["matches"]:
-        for match in matches[0]["matches"]:
-            # match 格式：(相似度, 文本片段, 文章标题, zhihu_link)
-            parts += f"素材：{match[1]} (链接：{match[3]})\n"
-    return parts
-
-# --------------------------
-# 旧业务代码开始
-# 自旋锁实现
 class SpinLock:
     def __init__(self):
         self.lock = threading.Lock()
@@ -127,13 +98,36 @@ class SpinLock:
         self.release()
 
 global_lock = SpinLock()
-session = requests.Session()
-UNPROCESSED = "❌"
-PROCESSED = "✅"
 
-BATCH_SIZE = 10
-SENTENCE_BATCH_SIZE = 100
 
+def extract_json(response):
+    match = re.search(r'\{.*\}', response, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as e:
+            logging.warning(f"JSON 解析失败: {e}, 跳过该条数据: {response}")
+            return None
+    else:
+        logging.warning(f"未找到 JSON 数据: {response}")
+        return None
+
+def clean_value(value):
+    """简单清洗返回值（如去除两端空格）"""
+    return value.strip() if isinstance(value, str) else value
+
+def query_partitions(sentence, k=3, threshold=0.4):
+    """
+    根据输入的句子，使用 find_matches 查询获得前 k 个匹配的文本切片，
+    拼接片段内容和对应链接形成素材字符串。
+    """
+    matches = find_matches([sentence], top_n=k, threshold=threshold)
+    parts = ""
+    if matches and matches[0]["matches"]:
+        for match in matches[0]["matches"]:
+            # match 格式：(相似度, 文本片段, 文章标题, zhihu_link)
+            parts += f"素材：{match[1]} (链接：{match[3]})\n"
+    return parts
 
 def clean_text(text):
     logging.info("清洗文本")
@@ -142,8 +136,6 @@ def clean_text(text):
     text = re.sub(r'<svg.*?>.*?</svg>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
-
-
 
 def safe_write_json(filepath, data):
     temp_filepath = filepath + ".tmp"
@@ -342,7 +334,7 @@ def get_batch_embeddings(chunks, article_titles, urls, provider="zhipu"):
             if provider == "zhipu":
                 # 调用 Zhipu SDK
                 response = zhipu_client.embeddings.create(
-                    model=MODEL_NAME_ZHIPU,
+                    model=EMBEDDING_MODEL,
                     input=batch_chunks
                 )
                 if "data" in response and response["data"]:
@@ -355,14 +347,14 @@ def get_batch_embeddings(chunks, article_titles, urls, provider="zhipu"):
             elif provider == "openai":
                 # 使用 requests 调用 OpenAI（示例）
                 headers = {
-                    "Authorization": f"Bearer {API_KEY_OPENAI}",
+                    "Authorization": f"Bearer {API_KEY}",
                     "Content-Type": "application/json"
                 }
                 data = {
                     "input": batch_chunks,
-                    "model": MODEL_NAME_OPENAI
+                    "model": EMBEDDING_MODEL
                 }
-                response = requests.post(API_URL_OPENAI, headers=headers, json=data, timeout=30)
+                response = requests.post(API_URL, headers=headers, json=data, timeout=30)
                 response.raise_for_status()
                 response_json = response.json()
                 if "data" in response_json and response_json["data"]:
@@ -442,6 +434,80 @@ def get_embedding(text, article_title, url, is_query=False):
     logging.error(f"达到最大重试次数，跳过该文本: {text[:30]}")
     return None
 
+def get_batch_embeddings(texts, article_title, url, is_query=False, batch_size=64):
+    global metadata_cache, embedding_vectors, system_metadata_cache, system_embedding_vectors
+
+    if is_query:
+        embedding_cache = system_embedding_vectors
+        metadata_cache_ref = system_metadata_cache
+        save_metadata_cache_func = save_system_metadata_cache
+        save_embedding_cache_func = save_system_embedding_cache
+    else:
+        embedding_cache = embedding_vectors
+        metadata_cache_ref = metadata_cache
+        save_metadata_cache_func = save_metadata_cache
+        save_embedding_cache_func = save_embedding_cache
+
+    # 提取未缓存的文本及其 hash
+    new_texts, new_text_hashes = [], []
+    for text in texts:
+        h = hash_sentence(text)
+        with global_lock:
+            if h not in embedding_cache:
+                new_texts.append(text)
+                new_text_hashes.append(h)
+
+    if not new_texts:
+        logging.info("所有嵌入均已存在于缓存中")
+        return [embedding_cache[hash_sentence(t)] for t in texts]
+
+    # 分批处理，每批最多 64 个
+    for i in range(0, len(new_texts), batch_size):
+        batch_texts = new_texts[i:i + batch_size]
+        batch_hashes = new_text_hashes[i:i + batch_size]
+
+        headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+        data = {"input": batch_texts, "model": MODEL_NAME}
+        max_retries = 3
+        retry_delay = 5
+
+        for attempt in range(max_retries):
+            try:
+                logging.info(f"请求 OpenAI API 获取嵌入 (尝试 {attempt+1}/{max_retries})，本批 %d 条", len(batch_texts))
+                response = requests.post(API_URL, headers=headers, json=data, timeout=60)
+                response.raise_for_status()
+                response_json = response.json()
+
+                if "data" in response_json:
+                    with global_lock:
+                        for item in response_json["data"]:
+                            h = batch_hashes[item["index"]]
+                            emb = item["embedding"]
+                            embedding_cache[h] = emb
+                            metadata_cache_ref[h] = {
+                                "sentence": batch_texts[item["index"]],
+                                "article": article_title if not is_query else "预设 query",
+                                "url": url.strip() if not is_query else "#"
+                            }
+                    break  # 本批成功，跳出 retry 循环
+                else:
+                    logging.error(f"API 返回格式错误: {response_json}")
+                    break
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"网络错误: {e}, 正在重试 ({attempt+1}/{max_retries})...")
+                time.sleep(retry_delay)
+        else:
+            logging.error("达到最大重试次数，本批失败")
+
+    # 保存全部缓存
+    with global_lock:
+        save_metadata_cache_func()
+        save_embedding_cache_func()
+
+    # 返回完整嵌入列表（含已有的 + 本次新增的）
+    return [embedding_cache.get(hash_sentence(t)) for t in texts]
+
+
 def process_sentences(chunks, article_title, url):
     logging.info("处理文章切片（并发模式），文章标题: %s, 切片数量: %d", article_title, len(chunks))
     filtered_chunks = []
@@ -454,10 +520,15 @@ def process_sentences(chunks, article_title, url):
     if not filtered_chunks:
         logging.info("所有切片均已计算，无需再次处理")
         return
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(get_embedding, chunk, article_title, url, is_query=False) for chunk in filtered_chunks]
-        for future in concurrent.futures.as_completed(futures):
-            _ = future.result()
+
+    if BATCH_REQUEST_TO_ZHIPU:
+        _ = get_batch_embeddings(filtered_chunks, article_title, url, is_query=False)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKER) as executor:
+            futures = [executor.submit(get_embedding, chunk, article_title, url, is_query=False) for chunk in filtered_chunks]
+            for future in concurrent.futures.as_completed(futures):
+                _ = future.result()
+    
 
 def load_articles(file_path, sample_ratio=0.1, sample_count=None):
     logging.info("加载文章文件: %s", file_path)
@@ -534,7 +605,7 @@ def load_articles(file_path, sample_ratio=0.1, sample_count=None):
         index_df.loc[index_df["url"].apply(lambda x: x.strip()) == row["url"].strip(), "processed"] = PROCESSED
     index_df = save_index(index_df)
     logging.info("采样文章加载并处理完毕")
-    return articles, index_df
+    
 
 def process_articles(valid_articles, index_df):
     unprocessed_articles = index_df[index_df["processed"] == UNPROCESSED]
@@ -620,8 +691,8 @@ def find_matches(leaf_nodes, top_n=10, threshold=0.6):
 
 def save_results(matches, processed_count, total_slices, top_n, threshold):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs(timestamp, exist_ok=True)
-    result_filename = f"{timestamp}/{processed_count}篇{total_slices}切片中排名前{top_n}相似度大于{threshold}的检索结果.md"
+    os.makedirs(f"{OUTPUT_DIR}/{timestamp}", exist_ok=True)
+    result_filename = f"{OUTPUT_DIR}/{timestamp}/{processed_count}篇{total_slices}切片中排名前{top_n}相似度大于{threshold}的检索结果.md"
     logging.info("保存检索结果到: %s", result_filename)
     with open(result_filename, "w", encoding="utf-8") as f:
         f.write("# 匹配结果\n\n")
@@ -646,11 +717,6 @@ def extract_leaf_nodes(tree):
         leaves.append(tree)
     return leaves
 
-# --------------------------
-# 旧业务代码结束
-
-# --------------------------
-# 新业务代码开始
 def new_business_run(df):
     """
     对输入 DataFrame 中的每一行进行处理，生成内心旁白，
@@ -743,7 +809,7 @@ def new_business_run(df):
 
 def make_inner_monologue_by_kimi(mode=None):
     """
-    新业务：从 CSV 中抽样句子生成内心旁白，并保存生成结果；
+    从 CSV 中抽样句子生成内心旁白，并保存生成结果；
     对生成失败的句子保存到 fail.csv 中，且支持重试。
     """
     if not mode:
@@ -793,7 +859,7 @@ def make_inner_monologue_by_kimi(mode=None):
 
     results, fails = new_business_run(df)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    result_filename = f"{OUTPUT_DIR}/new_business_results_{timestamp}.csv"
+    result_filename = f"{OUTPUT_DIR}/{timestamp}-{cache_dir}.csv"
     df_results = pd.DataFrame(results)
     df_results.to_csv(result_filename, index=False, encoding='utf-8-sig')
     logging.info("新业务生成结果已保存到 CSV 文件: %s", result_filename)
@@ -810,28 +876,171 @@ def make_inner_monologue_by_kimi(mode=None):
             make_inner_monologue_by_kimi(mode="2")
     else:
         print("全部生成成功，无失败记录。")
-# 新业务代码结束
 
-# --------------------------
-# 主程序入口
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="文章检索与嵌入处理")
-    parser.add_argument("-q", "--question", type=str, help="输入单个检索 query")
-    parser.add_argument("--debug", action="store_true", help="是否显示 DEBUG 信息")
-    args = parser.parse_args()
-    if args.debug:
+
+
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser(description="文章检索与嵌入处理")
+#     parser.add_argument("-q", "--question", type=str, help="输入单个检索 query")
+#     parser.add_argument("--debug", action="store_true", help="是否显示 DEBUG 信息")
+#     args = parser.parse_args()
+#     if args.debug:
+#         logging.getLogger().setLevel(logging.DEBUG)
+#         logging.debug("DEBUG 模式已开启")
+
+#     current_index = load_index()
+#     if current_index.empty:
+#         total_articles, effective_count, current_index = build_index_from_articles(ARTICLES_FILE)
+#         logging.info("当前总文章数量: %d", total_articles)
+#         logging.info("当前有效文章数量: %d", effective_count)
+#         logging.info("索引表中共有 %d 篇文章", effective_count)
+#         current_index = save_index(current_index)
+#     else:
+#         logging.info("索引表中共有 %d 篇文章", len(current_index))
+#     current_index = update_index_from_metadata(current_index, metadata_cache)
+#     total_index_count = len(current_index)
+#     processed_count = len(current_index[current_index["processed"] == PROCESSED])
+#     logging.info("当前已建立索引的文章数量: %d", total_index_count)
+#     logging.info("当前已建立切片的文章数量: %d", processed_count)
+#     logging.info("当前未建立切片的文章数量: %d", total_index_count - processed_count)
+#     logging.info("当前总切片数量：%d", len(embedding_vectors))
+    
+#     if args.question:
+#         query = args.question
+#         logging.info("收到检索 query: %s", query)
+#         try:
+#             top_n = int(input("请输入保留的匹配数量（默认10）: ").strip() or 10)
+#         except:
+#             top_n = 10
+#         try:
+#             threshold = float(input("请输入相似度阈值（默认0.6）: ").strip() or 0.6)
+#         except:
+#             threshold = 0.6
+#         matches = find_matches([query], top_n=top_n, threshold=threshold)
+#         save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+#     else:
+#         print(f"{cache_dir}")
+#         print("请选择后续操作:")
+#         print("1. 添加新的切片内容（处理新文章）")
+#         print("2. 直接进行查询")
+#         print("3. 生成自我旁白（新业务）")
+#         choice = input("请输入 1, 2 或 3：").strip()
+#         if choice == "1":
+#             logging.info("用户选择添加新的切片内容")
+#             current_index = load_index()
+#             unprocessed_articles = current_index[current_index["processed"] == UNPROCESSED]
+#             unprocessed_count = len(unprocessed_articles)
+#             print(f"当前还有 {unprocessed_count} 篇文章未处理。")
+#             while True:
+#                 try:
+#                     sample_count = int(input("请输入要添加处理的文章数量（不超过未处理文章数量）：").strip())
+#                     if 1 <= sample_count <= unprocessed_count:
+#                         break
+#                     else:
+#                         print(f"请输入一个介于 1 到 {unprocessed_count} 的整数。")
+#                 except ValueError:
+#                     print("输入无效，请输入一个整数。")
+#             valid_articles, index_df = load_articles(ARTICLES_FILE, sample_count=sample_count)
+#             current_index = load_index()  # 重新加载更新后的索引
+#             total_index_count = len(current_index)
+#             processed_count = len(current_index[current_index["processed"] == PROCESSED])
+#             logging.info("当前已建立索引的文章数量: %d", total_index_count)
+#             logging.info("当前已建立切片的文章数量: %d", processed_count)
+#             try:
+#                 top_n = int(input("请输入保留的匹配数量（默认10）: ").strip() or 10)
+#             except:
+#                 top_n = 10
+#             try:
+#                 threshold = float(input("请输入相似度阈值（默认0.6）: ").strip() or 0.6)
+#             except:
+#                 threshold = 0.6
+#             sub_choice = input("请选择查询模式:\n1. 自定义 query\n2. 使用 system.json 中预设的 query\n请输入 1 或 2：").strip()
+#             if sub_choice == "1":
+#                 query = input("请输入检索 query: ").strip()
+#                 if query:
+#                     matches = find_matches([query], top_n=top_n, threshold=threshold)
+#                     save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+#                 else:
+#                     logging.info("未进行查询")
+#             elif sub_choice == "2":
+#                 logging.info("使用 system.json 中预设的 query")
+#                 try:
+#                     with open(SYSTEM_FILE, "r", encoding="utf-8") as f:
+#                         json_tree = json.load(f)
+#                     preset_queries = extract_leaf_nodes(json_tree.get("家族", {}))
+#                     if preset_queries:
+#                         matches = find_matches(preset_queries, top_n=top_n, threshold=threshold)
+#                         save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+#                     else:
+#                         logging.info("system.json 中没有预设的 query")
+#                 except Exception as e:
+#                     logging.error("读取 system.json 失败: %s", e)
+#             else:
+#                 logging.info("未选择任何查询模式，程序退出")
+#         elif choice == "2":
+#             logging.info("用户选择直接进行查询")
+#             sub_choice = input("请选择查询模式:\n1. 自定义 query\n2. 使用 system.json 中预设的 query\n请输入 1 或 2：").strip()
+#             try:
+#                 top_n = int(input("请输入保留的匹配数量（默认10）: ").strip() or 10)
+#             except:
+#                 top_n = 10
+#             try:
+#                 threshold = float(input("请输入相似度阈值（默认0.6）: ").strip() or 0.6)
+#             except:
+#                 threshold = 0.6
+#             if sub_choice == "1":
+#                 query = input("请输入检索 query: ").strip()
+#                 if query:
+#                     matches = find_matches([query], top_n=top_n, threshold=threshold)
+#                     save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+#                 else:
+#                     logging.info("未进行查询")
+#             elif sub_choice == "2":
+#                 logging.info("使用 system.json 中预设的 query")
+#                 try:
+#                     with open(SYSTEM_FILE, "r", encoding="utf-8") as f:
+#                         json_tree = json.load(f)
+#                     preset_queries = extract_leaf_nodes(json_tree.get("家族", {}))
+#                     if preset_queries:
+#                         matches = find_matches(preset_queries, top_n=top_n, threshold=threshold)
+#                         save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+#                     else:
+#                         logging.info("system.json 中没有预设的 query")
+#                 except Exception as e:
+#                     logging.error("读取 system.json 失败: %s", e)
+#             else:
+#                 logging.info("未选择任何查询模式，程序退出")
+#         elif choice == "3":
+#             logging.info("用户选择新业务：生成自我旁白")
+#             make_inner_monologue_by_kimi()
+#         else:
+#             logging.info("未选择任何操作，程序退出")
+
+import argparse
+import logging
+import json
+
+
+def setup_logging(debug: bool):
+    if debug:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.debug("DEBUG 模式已开启")
 
+
+def load_or_build_index():
     current_index = load_index()
     if current_index.empty:
-        total_articles, effective_count, current_index = build_index_from_articles("./data/articles.json")
+        total_articles, effective_count, current_index = build_index_from_articles(ARTICLES_FILE)
         logging.info("当前总文章数量: %d", total_articles)
         logging.info("当前有效文章数量: %d", effective_count)
         logging.info("索引表中共有 %d 篇文章", effective_count)
         current_index = save_index(current_index)
     else:
         logging.info("索引表中共有 %d 篇文章", len(current_index))
+    return current_index
+
+
+def update_and_log_index(current_index):
     current_index = update_index_from_metadata(current_index, metadata_cache)
     total_index_count = len(current_index)
     processed_count = len(current_index[current_index["processed"] == PROCESSED])
@@ -839,20 +1048,96 @@ if __name__ == "__main__":
     logging.info("当前已建立切片的文章数量: %d", processed_count)
     logging.info("当前未建立切片的文章数量: %d", total_index_count - processed_count)
     logging.info("当前总切片数量：%d", len(embedding_vectors))
+    return processed_count
+
+
+def handle_query(query: str, top_n: int, threshold: float, processed_count: int):
+    logging.info("收到检索 query: %s", query)
+    matches = find_matches([query], top_n=top_n, threshold=threshold)
+    save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+
+
+def add_new_slices():
+    logging.info("用户选择添加新的切片内容")
+    current_index = load_index()
+    unprocessed_articles = current_index[current_index["processed"] == UNPROCESSED]
+    unprocessed_count = len(unprocessed_articles)
+    print(f"当前还有 {unprocessed_count} 篇文章未处理。")
+
+    sample_count = get_sample_count(unprocessed_count)
+    load_articles(ARTICLES_FILE, sample_count=sample_count)
+    current_index = load_index()
     
+    top_n, threshold = get_top_n_threshold()
+
+    sub_choice = input("请选择查询模式:\n1. 自定义 query\n2. 使用 system.json 中预设的 query\n请输入 1 或 2：").strip()
+    processed_count = len(current_index[current_index["processed"] == PROCESSED])
+    if sub_choice == "1":
+        query = input("请输入检索 query: ").strip()
+        if query:
+            handle_query(query, top_n, threshold, processed_count)
+        else:
+            logging.info("未进行查询")
+    elif sub_choice == "2":
+        use_preset_queries(top_n, threshold, processed_count)
+    else:
+        logging.info("未选择任何查询模式，程序退出")
+
+
+def use_preset_queries(top_n, threshold, processed_count):
+    logging.info("使用 system.json 中预设的 query")
+    try:
+        with open(SYSTEM_FILE, "r", encoding="utf-8") as f:
+            json_tree = json.load(f)
+        preset_queries = extract_leaf_nodes(json_tree.get("家族", {}))
+        if preset_queries:
+            matches = find_matches(preset_queries, top_n=top_n, threshold=threshold)
+            save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+        else:
+            logging.info("system.json 中没有预设的 query")
+    except Exception as e:
+        logging.error("读取 system.json 失败: %s", e)
+
+
+def get_sample_count(unprocessed_count):
+    while True:
+        try:
+            sample_count = int(input(f"请输入要添加处理的文章数量（不超过未处理文章数量 {unprocessed_count}）：").strip())
+            if 1 <= sample_count <= unprocessed_count:
+                return sample_count
+            else:
+                print(f"请输入一个介于 1 到 {unprocessed_count} 的整数。")
+        except ValueError:
+            print("输入无效，请输入一个整数。")
+
+
+def get_top_n_threshold():
+    try:
+        top_n = int(input("请输入保留的匹配数量（默认10）: ").strip() or 10)
+    except:
+        top_n = 10
+    try:
+        threshold = float(input("请输入相似度阈值（默认0.6）: ").strip() or 0.6)
+    except:
+        threshold = 0.6
+    return top_n, threshold
+
+
+def main():
+    parser = argparse.ArgumentParser(description="文章检索与嵌入处理")
+    parser.add_argument("-q", "--question", type=str, help="输入单个检索 query")
+    parser.add_argument("--debug", action="store_true", help="是否显示 DEBUG 信息")
+    args = parser.parse_args()
+
+    setup_logging(args.debug)
+
+    current_index = load_or_build_index()
+    processed_count = update_and_log_index(current_index)
+
     if args.question:
         query = args.question
-        logging.info("收到检索 query: %s", query)
-        try:
-            top_n = int(input("请输入保留的匹配数量（默认10）: ").strip() or 10)
-        except:
-            top_n = 10
-        try:
-            threshold = float(input("请输入相似度阈值（默认0.6）: ").strip() or 0.6)
-        except:
-            threshold = 0.6
-        matches = find_matches([query], top_n=top_n, threshold=threshold)
-        save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+        top_n, threshold = get_top_n_threshold()
+        handle_query(query, top_n, threshold, processed_count)
     else:
         print(f"{cache_dir}")
         print("请选择后续操作:")
@@ -861,88 +1146,19 @@ if __name__ == "__main__":
         print("3. 生成自我旁白（新业务）")
         choice = input("请输入 1, 2 或 3：").strip()
         if choice == "1":
-            logging.info("用户选择添加新的切片内容")
-            current_index = load_index()
-            unprocessed_articles = current_index[current_index["processed"] == UNPROCESSED]
-            unprocessed_count = len(unprocessed_articles)
-            print(f"当前还有 {unprocessed_count} 篇文章未处理。")
-            while True:
-                try:
-                    sample_count = int(input("请输入要添加处理的文章数量（不超过未处理文章数量）：").strip())
-                    if 1 <= sample_count <= unprocessed_count:
-                        break
-                    else:
-                        print(f"请输入一个介于 1 到 {unprocessed_count} 的整数。")
-                except ValueError:
-                    print("输入无效，请输入一个整数。")
-            valid_articles, index_df = load_articles("./data/articles.json", sample_count=sample_count)
-            current_index = load_index()  # 重新加载更新后的索引
-            total_index_count = len(current_index)
-            processed_count = len(current_index[current_index["processed"] == PROCESSED])
-            logging.info("当前已建立索引的文章数量: %d", total_index_count)
-            logging.info("当前已建立切片的文章数量: %d", processed_count)
-            try:
-                top_n = int(input("请输入保留的匹配数量（默认10）: ").strip() or 10)
-            except:
-                top_n = 10
-            try:
-                threshold = float(input("请输入相似度阈值（默认0.6）: ").strip() or 0.6)
-            except:
-                threshold = 0.6
-            sub_choice = input("请选择查询模式:\n1. 自定义 query\n2. 使用 system.json 中预设的 query\n请输入 1 或 2：").strip()
-            if sub_choice == "1":
-                query = input("请输入检索 query: ").strip()
-                if query:
-                    matches = find_matches([query], top_n=top_n, threshold=threshold)
-                    save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
-                else:
-                    logging.info("未进行查询")
-            elif sub_choice == "2":
-                logging.info("使用 system.json 中预设的 query")
-                try:
-                    with open(SYSTEM_FILE, "r", encoding="utf-8") as f:
-                        json_tree = json.load(f)
-                    preset_queries = extract_leaf_nodes(json_tree.get("家族", {}))
-                    if preset_queries:
-                        matches = find_matches(preset_queries, top_n=top_n, threshold=threshold)
-                        save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
-                    else:
-                        logging.info("system.json 中没有预设的 query")
-                except Exception as e:
-                    logging.error("读取 system.json 失败: %s", e)
-            else:
-                logging.info("未选择任何查询模式，程序退出")
+            add_new_slices()
         elif choice == "2":
             logging.info("用户选择直接进行查询")
             sub_choice = input("请选择查询模式:\n1. 自定义 query\n2. 使用 system.json 中预设的 query\n请输入 1 或 2：").strip()
-            try:
-                top_n = int(input("请输入保留的匹配数量（默认10）: ").strip() or 10)
-            except:
-                top_n = 10
-            try:
-                threshold = float(input("请输入相似度阈值（默认0.6）: ").strip() or 0.6)
-            except:
-                threshold = 0.6
+            top_n, threshold = get_top_n_threshold()
             if sub_choice == "1":
                 query = input("请输入检索 query: ").strip()
                 if query:
-                    matches = find_matches([query], top_n=top_n, threshold=threshold)
-                    save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
+                    handle_query(query, top_n, threshold, processed_count)
                 else:
                     logging.info("未进行查询")
             elif sub_choice == "2":
-                logging.info("使用 system.json 中预设的 query")
-                try:
-                    with open(SYSTEM_FILE, "r", encoding="utf-8") as f:
-                        json_tree = json.load(f)
-                    preset_queries = extract_leaf_nodes(json_tree.get("家族", {}))
-                    if preset_queries:
-                        matches = find_matches(preset_queries, top_n=top_n, threshold=threshold)
-                        save_results(matches, processed_count, len(embedding_vectors), top_n, threshold)
-                    else:
-                        logging.info("system.json 中没有预设的 query")
-                except Exception as e:
-                    logging.error("读取 system.json 失败: %s", e)
+                use_preset_queries(top_n, threshold, processed_count)
             else:
                 logging.info("未选择任何查询模式，程序退出")
         elif choice == "3":
@@ -950,3 +1166,7 @@ if __name__ == "__main__":
             make_inner_monologue_by_kimi()
         else:
             logging.info("未选择任何操作，程序退出")
+
+
+if __name__ == "__main__":
+    main()
